@@ -258,10 +258,14 @@ async function fetchApi(url, options) {
 }
 
 function mapApiError(prefix, status, fallbackText) {
+  var fallback = normalizeString(fallbackText || "");
+  if (fallback.indexOf("TIDAL OAuth failed") === 0) return fallback;
+  if (fallback.indexOf("TIDAL API 401") !== -1) return "TIDAL API 401";
+  if (fallback.indexOf("TIDAL API 403") !== -1) return "TIDAL API 403";
   if (status === 401) return prefix + ": TIDAL API 401";
   if (status === 403) return prefix + ": TIDAL API 403";
   if (status === 0) return prefix + ": network error";
-  return prefix + ": " + normalizeString(fallbackText || "request failed");
+  return prefix + ": " + (fallback || "request failed");
 }
 
 async function resolveAccessToken(context) {
