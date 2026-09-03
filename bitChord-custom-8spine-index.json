@@ -1,0 +1,71 @@
+{
+  "category:modules": [
+    {
+      "id": "tidal-custom-101",
+      "name": "TIDAL CUSTOM",
+      "pkg": "com.8spine.module.tidal.custom",
+      "file": "8spine-tidal-module.8spine",
+      "download": "https://raw.githubusercontent.com/meskrebooted/tidal-module/main/8spine-tidal-module.8spine",
+      "version": "1.0.1",
+      "code": 101,
+      "type": "MODULE",
+      "author": "meskrebooted",
+      "description": "TIDAL lossless/Hi-Res source for 8SPINE.",
+      "tags": [
+        "TIDAL",
+        "LOSSLESS",
+        "HI-RES",
+        "DOLBY_ATMOS"
+      ],
+      "featured": true,
+      "trusted": false,
+      "nsfw": false,
+      "size": 0,
+      "lang": "all",
+      "folder": "modules",
+      "sources": [
+        {
+          "name": "TIDAL CUSTOM",
+          "lang": "all",
+          "id": "tidal-custom-101",
+          "baseUrl": "https://raw.githubusercontent.com/meskrebooted/tidal-module/main"
+        }
+      ]
+    },
+    {
+      "id": "youtube-music-direct-custom",
+      "name": "YOUTUBE MUSIC DIRECT",
+      "pkg": "com.8spine.module.youtube.music.direct.custom",
+      "file": "youtubeMusicDirect.8spine",
+      "download": "https://raw.githubusercontent.com/nvmindl/8spine-ytmusic/main/modules/youtubeMusicDirect.8spine",
+      "version": "current",
+      "code": 51,
+      "type": "MODULE",
+      "author": "nvmindl",
+      "description": "YouTube Music fallback source.",
+      "tags": [
+        "YT MUSIC",
+        "AUDIO",
+        "FALLBACK"
+      ],
+      "featured": false,
+      "trusted": false,
+      "nsfw": false,
+      "size": 0,
+      "lang": "all",
+      "folder": "modules",
+      "sources": [
+        {
+          "name": "YOUTUBE MUSIC DIRECT",
+          "lang": "all",
+          "id": "youtube-music-direct-custom",
+          "baseUrl": "https://raw.githubusercontent.com/nvmindl/8spine-ytmusic/main/modules"
+        }
+      ]
+    }
+  ],
+  "category:debrid_modules": [],
+  "category:geolier_modules": [],
+  "category:artworks": [],
+  "category:testing": []
+}
