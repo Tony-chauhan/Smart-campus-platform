@@ -5,12 +5,12 @@
       "name": "TIDAL CUSTOM",
       "pkg": "com.8spine.module.tidal.custom",
       "file": "8spine-tidal-module.8spine",
-      "download": "https://raw.githubusercontent.com/meskrebooted/tidal-module/main/8spine-tidal-module.8spine",
-      "version": "1.0.1",
+      "download": "https://raw.githubusercontent.com/Tony-chauhan/Smart-campus-platform/main/modules/8spine-tidal-module.8spine",
+      "version": "1.0.2",
       "code": 101,
       "type": "MODULE",
-      "author": "meskrebooted",
-      "description": "TIDAL lossless/Hi-Res source for 8SPINE.",
+      "author": "Tony-chauhan",
+      "description": "TIDAL source for 8SPINE patched for BitChord 1.5 QuickJS compatibility.",
       "tags": [
         "TIDAL",
         "LOSSLESS",
@@ -28,7 +28,7 @@
           "name": "TIDAL CUSTOM",
           "lang": "all",
           "id": "tidal-custom-101",
-          "baseUrl": "https://raw.githubusercontent.com/meskrebooted/tidal-module/main"
+          "baseUrl": "https://raw.githubusercontent.com/Tony-chauhan/Smart-campus-platform/main/modules"
         }
       ]
     },

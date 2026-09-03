@@ -1,0 +1,546 @@
+/* @8spine-meta
+ * type: MODULE
+ * category: modules
+ * featured: true
+ * trusted: false
+ * nsfw: false
+ */
+
+const MY_MODULE = {
+  id: "com.8spine.module.tidal.custom",
+  name: "TIDAL CUSTOM",
+  version: "1.0.2",
+  labels: ["TIDAL", "LOSSLESS", "DOLBY_ATMOS", "STREAMING"],
+  description: "TIDAL source with QuickJS-compatible query handling and robust quality fallback.",
+
+  settings: {
+    quality: {
+      type: "selector",
+      label: "Audio Quality",
+      description: "Preferred TIDAL quality.",
+      options: [
+        { label: "Dolby Atmos", value: "DOLBY_ATMOS" },
+        { label: "Hi-Res Lossless", value: "HI_RES_LOSSLESS" },
+        { label: "Lossless", value: "LOSSLESS" },
+        { label: "High", value: "HIGH" },
+        { label: "Low", value: "LOW" }
+      ],
+      defaultValue: "LOSSLESS"
+    }
+  },
+
+  searchTracks: function(query, limit) {
+    return searchTracks(query, limit);
+  },
+
+  getTrackStreamUrl: function(trackId, preferredQuality, context) {
+    var selectedQuality =
+      context && context.settings && context.settings.quality
+        ? context.settings.quality.value
+        : preferredQuality;
+    return getTrackStreamUrl(trackId, selectedQuality);
+  }
+};
+
+const PUBLIC_TOKEN = "49YxDN9a2aFV6RTG";
+const BASE_URL = "https://api.tidal.com";
+const DEFAULT_COUNTRY_CODE = "US";
+const QUALITY = {
+  DOLBY_ATMOS: "DOLBY_ATMOS",
+  HI_RES_LOSSLESS: "HI_RES_LOSSLESS",
+  LOSSLESS: "LOSSLESS",
+  HIGH: "HIGH",
+  LOW: "LOW"
+};
+
+function normalizeString(value) {
+  if (value === null || value === undefined) return "";
+  return String(value);
+}
+
+function normalizeNumber(value, fallback) {
+  var n = Number(value);
+  return isFinite(n) ? n : fallback;
+}
+
+function buildQuery(params) {
+  var keys = Object.keys(params || {});
+  var parts = [];
+
+  for (var i = 0; i < keys.length; i++) {
+    var key = keys[i];
+    var value = params[key];
+    if (value === null || value === undefined) continue;
+    parts.push(encodeURIComponent(key) + "=" + encodeURIComponent(String(value)));
+  }
+
+  return parts.join("&");
+}
+
+function createHeaders() {
+  return {
+    Accept: "application/json",
+    "x-tidal-token": PUBLIC_TOKEN,
+    Authorization: "Bearer " + PUBLIC_TOKEN
+  };
+}
+
+function isObject(value) {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function safeJsonParse(text) {
+  try {
+    return JSON.parse(text);
+  } catch (_error) {
+    return null;
+  }
+}
+
+function base64Decode(input) {
+  var chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=";
+  var str = normalizeString(input).replace(/\s+/g, "");
+  var output = "";
+  var i;
+
+  if (!str) return "";
+
+  for (i = 0; i < str.length; i += 4) {
+    var enc1 = chars.indexOf(str.charAt(i));
+    var enc2 = chars.indexOf(str.charAt(i + 1));
+    var enc3 = chars.indexOf(str.charAt(i + 2));
+    var enc4 = chars.indexOf(str.charAt(i + 3));
+
+    if (enc1 < 0 || enc2 < 0) break;
+
+    var chr1 = (enc1 << 2) | (enc2 >> 4);
+    output += String.fromCharCode(chr1);
+
+    if (enc3 !== 64 && enc3 >= 0) {
+      var chr2 = ((enc2 & 15) << 4) | (enc3 >> 2);
+      output += String.fromCharCode(chr2);
+    }
+
+    if (enc4 !== 64 && enc4 >= 0) {
+      var chr3 = ((enc3 & 3) << 6) | enc4;
+      output += String.fromCharCode(chr3);
+    }
+  }
+
+  return output;
+}
+
+function decodeManifest(manifest) {
+  if (!manifest) return null;
+
+  var parsed = safeJsonParse(manifest);
+  if (parsed) return parsed;
+
+  var decoded = base64Decode(manifest);
+  if (!decoded) return null;
+
+  return safeJsonParse(decoded);
+}
+
+async function fetchJson(url) {
+  var response;
+  var data = null;
+
+  try {
+    response = await fetch(url, {
+      method: "GET",
+      headers: createHeaders()
+    });
+  } catch (error) {
+    return {
+      ok: false,
+      status: 0,
+      error: "Network request failed: " + normalizeString(error && error.message)
+    };
+  }
+
+  try {
+    data = await response.json();
+  } catch (_error) {
+    data = null;
+  }
+
+  if (!response.ok) {
+    return {
+      ok: false,
+      status: response.status,
+      error: "HTTP " + response.status,
+      data: data
+    };
+  }
+
+  return {
+    ok: true,
+    status: response.status,
+    data: data
+  };
+}
+
+function getArtistName(track) {
+  if (!isObject(track)) return "";
+
+  if (track.artist && track.artist.name) return normalizeString(track.artist.name);
+
+  if (Array.isArray(track.artists) && track.artists.length > 0) {
+    var names = [];
+    for (var i = 0; i < track.artists.length; i++) {
+      var artist = track.artists[i];
+      if (!artist) continue;
+      if (artist.name) names.push(normalizeString(artist.name));
+      else if (typeof artist === "string") names.push(artist);
+    }
+    return names.join(", ");
+  }
+
+  return "";
+}
+
+function getAlbumName(track) {
+  if (!isObject(track)) return "";
+  if (track.album && track.album.title) return normalizeString(track.album.title);
+  if (track.album && track.album.name) return normalizeString(track.album.name);
+  if (track.albumTitle) return normalizeString(track.albumTitle);
+  return "";
+}
+
+function getAlbumCover(track) {
+  if (!isObject(track)) return null;
+
+  var album = track.album || {};
+  if (album.imageUrl) return normalizeString(album.imageUrl);
+  if (album.cover) return normalizeString(album.cover);
+
+  if (Array.isArray(album.images) && album.images.length > 0) {
+    for (var i = 0; i < album.images.length; i++) {
+      var image = album.images[i];
+      if (image && image.url) return normalizeString(image.url);
+      if (typeof image === "string") return image;
+    }
+  }
+
+  if (track.imageUrl) return normalizeString(track.imageUrl);
+  return null;
+}
+
+function normalizeTrack(track) {
+  if (!isObject(track)) return null;
+
+  var id = track.id !== undefined ? track.id : track.trackId;
+  if (id === undefined || id === null || id === "") return null;
+
+  return {
+    id: normalizeString(id),
+    title: normalizeString(track.title || track.name || ""),
+    artist: getArtistName(track),
+    album: getAlbumName(track),
+    duration: normalizeNumber(track.duration || track.durationSec || 0, 0),
+    albumCover: getAlbumCover(track)
+  };
+}
+
+function extractSearchItems(data) {
+  if (!data) return [];
+
+  if (Array.isArray(data.tracks)) return data.tracks;
+
+  if (isObject(data.tracks) && Array.isArray(data.tracks.items)) return data.tracks.items;
+
+  if (Array.isArray(data.items)) return data.items;
+
+  return [];
+}
+
+function normalizeQuality(quality) {
+  var q = normalizeString(quality).toUpperCase();
+
+  if (q === QUALITY.DOLBY_ATMOS) return QUALITY.DOLBY_ATMOS;
+  if (q === QUALITY.HI_RES_LOSSLESS) return QUALITY.HI_RES_LOSSLESS;
+  if (q === QUALITY.LOSSLESS) return QUALITY.LOSSLESS;
+  if (q === QUALITY.HIGH) return QUALITY.HIGH;
+  if (q === QUALITY.LOW) return QUALITY.LOW;
+
+  return QUALITY.LOSSLESS;
+}
+
+function qualityFallbackOrder(requested) {
+  switch (requested) {
+    case QUALITY.DOLBY_ATMOS:
+      return [QUALITY.DOLBY_ATMOS, QUALITY.HI_RES_LOSSLESS, QUALITY.LOSSLESS, QUALITY.HIGH, QUALITY.LOW];
+    case QUALITY.HI_RES_LOSSLESS:
+      return [QUALITY.HI_RES_LOSSLESS, QUALITY.LOSSLESS, QUALITY.HIGH, QUALITY.LOW];
+    case QUALITY.LOSSLESS:
+      return [QUALITY.LOSSLESS, QUALITY.HIGH, QUALITY.LOW];
+    case QUALITY.HIGH:
+      return [QUALITY.HIGH, QUALITY.LOW];
+    case QUALITY.LOW:
+      return [QUALITY.LOW, QUALITY.HIGH];
+    default:
+      return [QUALITY.LOSSLESS, QUALITY.HIGH, QUALITY.LOW];
+  }
+}
+
+function normalizeCandidateQuality(value) {
+  var normalized = normalizeQuality(value);
+  return normalized;
+}
+
+function pushCandidate(candidates, url, quality, mimeType, isLossless) {
+  if (!url) return;
+  var asString = normalizeString(url);
+  if (!asString) return;
+
+  candidates.push({
+    streamUrl: asString,
+    quality: normalizeCandidateQuality(quality),
+    mimeType: normalizeString(mimeType || "audio/flac"),
+    isLossless: !!isLossless
+  });
+}
+
+function addAudioObjectCandidates(candidates, audioObj) {
+  if (!isObject(audioObj)) return;
+
+  var map = [
+    { key: "DolbyAtmos", quality: QUALITY.DOLBY_ATMOS, lossless: false },
+    { key: "dolbyAtmos", quality: QUALITY.DOLBY_ATMOS, lossless: false },
+    { key: "hifi", quality: QUALITY.HI_RES_LOSSLESS, lossless: true },
+    { key: "hiRes", quality: QUALITY.HI_RES_LOSSLESS, lossless: true },
+    { key: "lossless", quality: QUALITY.LOSSLESS, lossless: true },
+    { key: "high", quality: QUALITY.HIGH, lossless: false },
+    { key: "standard", quality: QUALITY.LOW, lossless: false },
+    { key: "low", quality: QUALITY.LOW, lossless: false }
+  ];
+
+  for (var i = 0; i < map.length; i++) {
+    var entry = map[i];
+    var node = audioObj[entry.key];
+    if (!node) continue;
+
+    if (typeof node === "string") {
+      pushCandidate(candidates, node, entry.quality, null, entry.lossless);
+      continue;
+    }
+
+    if (isObject(node)) {
+      if (node.url) pushCandidate(candidates, node.url, node.audioQuality || entry.quality, node.mimeType, entry.lossless);
+      if (node.streamUrl) pushCandidate(candidates, node.streamUrl, node.audioQuality || entry.quality, node.mimeType, entry.lossless);
+      if (Array.isArray(node.urls)) {
+        for (var j = 0; j < node.urls.length; j++) {
+          pushCandidate(candidates, node.urls[j], node.audioQuality || entry.quality, node.mimeType, entry.lossless);
+        }
+      }
+    }
+  }
+}
+
+function extractPlaybackTrack(data) {
+  if (!data) return null;
+  if (Array.isArray(data.tracks) && data.tracks.length > 0) return data.tracks[0];
+  if (isObject(data.track)) return data.track;
+  if (isObject(data.item)) return data.item;
+  if (isObject(data)) return data;
+  return null;
+}
+
+function addManifestCandidates(candidates, data, requestedQuality) {
+  var manifest = decodeManifest(data && data.manifest);
+  if (!manifest) return;
+
+  var urls = [];
+  if (Array.isArray(manifest.urls)) urls = manifest.urls;
+  else if (manifest.url) urls = [manifest.url];
+
+  var derivedQuality =
+    data && data.audioQuality
+      ? data.audioQuality
+      : manifest.audioQuality
+      ? manifest.audioQuality
+      : requestedQuality;
+
+  var mimeType = manifest.mimeType || data.manifestMimeType || "audio/flac";
+  var quality = normalizeCandidateQuality(derivedQuality);
+  var isLossless = quality === QUALITY.HI_RES_LOSSLESS || quality === QUALITY.LOSSLESS || /flac/i.test(mimeType);
+
+  for (var i = 0; i < urls.length; i++) {
+    pushCandidate(candidates, urls[i], quality, mimeType, isLossless);
+  }
+}
+
+function addDirectUrlCandidates(candidates, data, requestedQuality) {
+  if (!data) return;
+
+  if (data.streamUrl) {
+    pushCandidate(candidates, data.streamUrl, data.audioQuality || requestedQuality, data.mimeType, false);
+  }
+
+  if (data.url) {
+    pushCandidate(candidates, data.url, data.audioQuality || requestedQuality, data.mimeType, false);
+  }
+
+  if (Array.isArray(data.urls)) {
+    for (var i = 0; i < data.urls.length; i++) {
+      pushCandidate(candidates, data.urls[i], data.audioQuality || requestedQuality, data.mimeType, false);
+    }
+  }
+}
+
+function chooseCandidate(candidates, requestedQuality) {
+  if (!Array.isArray(candidates) || candidates.length === 0) return null;
+
+  var order = qualityFallbackOrder(requestedQuality);
+
+  for (var i = 0; i < order.length; i++) {
+    var wanted = order[i];
+    for (var j = 0; j < candidates.length; j++) {
+      var item = candidates[j];
+      if (!item) continue;
+      if (item.quality === wanted) {
+        if ((wanted === QUALITY.HI_RES_LOSSLESS || wanted === QUALITY.LOSSLESS) && !item.isLossless) {
+          continue;
+        }
+        return item;
+      }
+    }
+  }
+
+  for (var k = 0; k < candidates.length; k++) {
+    if (candidates[k] && candidates[k].quality === QUALITY.HIGH) return candidates[k];
+  }
+
+  return candidates[0] || null;
+}
+
+function isForbiddenNonTidalStream(url) {
+  var normalized = normalizeString(url).toLowerCase();
+  if (!normalized) return true;
+  return normalized.indexOf("youtube.com") !== -1 || normalized.indexOf("googlevideo.com") !== -1;
+}
+
+async function searchTracks(query, limit) {
+  var q = normalizeString(query).trim();
+  var safeLimit = normalizeNumber(limit, 20);
+
+  if (!q) {
+    return { tracks: [], total: 0, error: "Search query is required" };
+  }
+
+  if (safeLimit <= 0) safeLimit = 20;
+  if (safeLimit > 100) safeLimit = 100;
+
+  var params = {
+    query: q,
+    limit: String(safeLimit),
+    "tidal:mediaArtist": "",
+    "tidal:mediaTrack": "",
+    "tidal:mediaAlbum": "",
+    "tidal:music": "Track",
+    countryCode: DEFAULT_COUNTRY_CODE
+  };
+
+  var url = BASE_URL + "/v1/search?" + buildQuery(params);
+  var result = await fetchJson(url);
+
+  if (!result.ok) {
+    return {
+      tracks: [],
+      total: 0,
+      error: "TIDAL search failed: " + result.error,
+      status: result.status
+    };
+  }
+
+  var rawTracks = extractSearchItems(result.data);
+  var tracks = [];
+
+  for (var i = 0; i < rawTracks.length; i++) {
+    var normalized = normalizeTrack(rawTracks[i]);
+    if (normalized) tracks.push(normalized);
+  }
+
+  return {
+    tracks: tracks,
+    total: tracks.length
+  };
+}
+
+async function getTrackStreamUrl(trackId, quality) {
+  var id = normalizeString(trackId).trim();
+  var requestedQuality = normalizeQuality(quality);
+
+  if (!id) {
+    return {
+      error: "Track id is required",
+      track: { id: "", audioQuality: requestedQuality }
+    };
+  }
+
+  var params = {
+    audioquality: requestedQuality,
+    playbackmode: "STREAM",
+    assetpresentation: "FULL",
+    countryCode: DEFAULT_COUNTRY_CODE
+  };
+
+  var url =
+    BASE_URL +
+    "/v1/tracks/" +
+    encodeURIComponent(id) +
+    "/playbackInfo?" +
+    buildQuery(params);
+
+  var result = await fetchJson(url);
+
+  if (!result.ok) {
+    return {
+      error: "TIDAL playbackInfo failed: " + result.error,
+      status: result.status,
+      track: { id: id, audioQuality: requestedQuality }
+    };
+  }
+
+  var data = result.data || {};
+  var playbackTrack = extractPlaybackTrack(data);
+  var candidates = [];
+
+  if (playbackTrack && playbackTrack.audio) {
+    addAudioObjectCandidates(candidates, playbackTrack.audio);
+  }
+
+  if (data.audio) {
+    addAudioObjectCandidates(candidates, data.audio);
+  }
+
+  addManifestCandidates(candidates, data, requestedQuality);
+  addDirectUrlCandidates(candidates, data, requestedQuality);
+
+  var selected = chooseCandidate(candidates, requestedQuality);
+  if (!selected || !selected.streamUrl) {
+    return {
+      error: "No playable TIDAL stream found for requested quality",
+      track: { id: id, audioQuality: requestedQuality }
+    };
+  }
+
+  if (isForbiddenNonTidalStream(selected.streamUrl)) {
+    return {
+      error: "PlaybackInfo returned a non-TIDAL stream URL",
+      track: { id: id, audioQuality: requestedQuality }
+    };
+  }
+
+  return {
+    streamUrl: selected.streamUrl,
+    mimeType: selected.mimeType,
+    track: {
+      id: id,
+      audioQuality: selected.quality
+    }
+  };
+}
+
+return MY_MODULE;
