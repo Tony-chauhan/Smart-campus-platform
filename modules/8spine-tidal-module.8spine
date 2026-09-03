@@ -9,9 +9,9 @@
 const MY_MODULE = {
   id: "com.8spine.module.tidal.custom",
   name: "TIDAL CUSTOM",
-  version: "1.0.2",
+  version: "1.1.0",
   labels: ["TIDAL", "LOSSLESS", "DOLBY_ATMOS", "STREAMING"],
-  description: "TIDAL source with QuickJS-compatible query handling and robust quality fallback.",
+  description: "TIDAL source using OAuth-compatible auth, modern v2 APIs, and robust quality fallback.",
 
   settings: {
     quality: {
@@ -26,11 +26,33 @@ const MY_MODULE = {
         { label: "Low", value: "LOW" }
       ],
       defaultValue: "LOSSLESS"
+    },
+    countryCode: {
+      type: "text",
+      label: "Country Code",
+      description: "Two-letter ISO country code (for example US, GB, DE).",
+      defaultValue: "US"
+    },
+    accessToken: {
+      type: "text",
+      label: "TIDAL OAuth Access Token (optional)",
+      description: "Optional pre-issued bearer token. If empty, OAuth client credentials are used."
+    },
+    clientId: {
+      type: "text",
+      label: "TIDAL OAuth Client ID",
+      description: "Required when access token is not provided."
+    },
+    clientSecret: {
+      type: "text",
+      label: "TIDAL OAuth Client Secret",
+      description: "Required when access token is not provided. Keep this private."
     }
   },
 
   searchTracks: function(query, limit) {
-    return searchTracks(query, limit);
+    var context = arguments.length > 2 ? arguments[2] : null;
+    return searchTracks(query, limit, context);
   },
 
   getTrackStreamUrl: function(trackId, preferredQuality, context) {
@@ -38,19 +60,28 @@ const MY_MODULE = {
       context && context.settings && context.settings.quality
         ? context.settings.quality.value
         : preferredQuality;
-    return getTrackStreamUrl(trackId, selectedQuality);
+    return getTrackStreamUrl(trackId, selectedQuality, context);
   }
 };
 
-const PUBLIC_TOKEN = "49YxDN9a2aFV6RTG";
-const BASE_URL = "https://api.tidal.com";
+const TIDAL_API_BASE_URL = "https://openapi.tidal.com/v2";
+const TIDAL_AUTH_URL = "https://auth.tidal.com/v1/oauth2/token";
 const DEFAULT_COUNTRY_CODE = "US";
+const DEFAULT_LIMIT = 20;
+const MAX_LIMIT = 100;
+
 const QUALITY = {
   DOLBY_ATMOS: "DOLBY_ATMOS",
   HI_RES_LOSSLESS: "HI_RES_LOSSLESS",
   LOSSLESS: "LOSSLESS",
   HIGH: "HIGH",
   LOW: "LOW"
+};
+
+var AUTH_CACHE = {
+  cacheKey: "",
+  token: "",
+  expiresAt: 0
 };
 
 function normalizeString(value) {
@@ -61,6 +92,22 @@ function normalizeString(value) {
 function normalizeNumber(value, fallback) {
   var n = Number(value);
   return isFinite(n) ? n : fallback;
+}
+
+function isObject(value) {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function safeJsonParse(text) {
+  try {
+    return JSON.parse(text);
+  } catch (_error) {
+    return null;
+  }
+}
+
+function nowEpochMs() {
+  return new Date().getTime();
 }
 
 function buildQuery(params) {
@@ -77,35 +124,40 @@ function buildQuery(params) {
   return parts.join("&");
 }
 
-function createHeaders() {
-  return {
-    Accept: "application/json",
-    "x-tidal-token": PUBLIC_TOKEN,
-    Authorization: "Bearer " + PUBLIC_TOKEN
-  };
+function buildUrl(path, queryParams) {
+  var qs = buildQuery(queryParams);
+  if (!qs) return TIDAL_API_BASE_URL + path;
+  return TIDAL_API_BASE_URL + path + "?" + qs;
 }
 
-function isObject(value) {
-  return !!value && typeof value === "object" && !Array.isArray(value);
-}
-
-function safeJsonParse(text) {
-  try {
-    return JSON.parse(text);
-  } catch (_error) {
-    return null;
+function getSettingValue(context, key, fallbackValue) {
+  var value = fallbackValue;
+  if (context && context.settings && context.settings[key]) {
+    var node = context.settings[key];
+    if (isObject(node) && node.value !== undefined && node.value !== null) {
+      value = node.value;
+    } else {
+      value = node;
+    }
   }
+  if (value === undefined || value === null) return fallbackValue;
+  return value;
+}
+
+function getCountryCode(context) {
+  var code = normalizeString(getSettingValue(context, "countryCode", DEFAULT_COUNTRY_CODE)).toUpperCase();
+  if (!/^[A-Z]{2}$/.test(code)) return DEFAULT_COUNTRY_CODE;
+  return code;
 }
 
 function base64Decode(input) {
   var chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=";
   var str = normalizeString(input).replace(/\s+/g, "");
   var output = "";
-  var i;
 
   if (!str) return "";
 
-  for (i = 0; i < str.length; i += 4) {
+  for (var i = 0; i < str.length; i += 4) {
     var enc1 = chars.indexOf(str.charAt(i));
     var enc2 = chars.indexOf(str.charAt(i + 1));
     var enc3 = chars.indexOf(str.charAt(i + 2));
@@ -130,39 +182,63 @@ function base64Decode(input) {
   return output;
 }
 
-function decodeManifest(manifest) {
-  if (!manifest) return null;
+function base64Encode(input) {
+  var chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=";
+  var str = normalizeString(input);
+  var output = "";
+  var i = 0;
 
-  var parsed = safeJsonParse(manifest);
-  if (parsed) return parsed;
+  while (i < str.length) {
+    var chr1 = str.charCodeAt(i++);
+    var chr2 = str.charCodeAt(i++);
+    var chr3 = str.charCodeAt(i++);
 
-  var decoded = base64Decode(manifest);
-  if (!decoded) return null;
+    var enc1 = chr1 >> 2;
+    var enc2 = ((chr1 & 3) << 4) | (chr2 >> 4);
+    var enc3 = ((chr2 & 15) << 2) | (chr3 >> 6);
+    var enc4 = chr3 & 63;
 
-  return safeJsonParse(decoded);
+    if (isNaN(chr2)) {
+      enc3 = 64;
+      enc4 = 64;
+    } else if (isNaN(chr3)) {
+      enc4 = 64;
+    }
+
+    output +=
+      chars.charAt(enc1) +
+      chars.charAt(enc2) +
+      chars.charAt(enc3) +
+      chars.charAt(enc4);
+  }
+
+  return output;
 }
 
-async function fetchJson(url) {
+async function fetchApi(url, options) {
   var response;
+  var text = "";
   var data = null;
 
   try {
-    response = await fetch(url, {
-      method: "GET",
-      headers: createHeaders()
-    });
+    response = await fetch(url, options || {});
   } catch (error) {
     return {
       ok: false,
       status: 0,
-      error: "Network request failed: " + normalizeString(error && error.message)
+      error: "Network request failed",
+      details: normalizeString(error && error.message)
     };
   }
 
   try {
-    data = await response.json();
+    text = await response.text();
   } catch (_error) {
-    data = null;
+    text = "";
+  }
+
+  if (text) {
+    data = safeJsonParse(text);
   }
 
   if (!response.ok) {
@@ -181,78 +257,118 @@ async function fetchJson(url) {
   };
 }
 
-function getArtistName(track) {
-  if (!isObject(track)) return "";
+function mapApiError(prefix, status, fallbackText) {
+  if (status === 401) return prefix + ": TIDAL API 401";
+  if (status === 403) return prefix + ": TIDAL API 403";
+  if (status === 0) return prefix + ": network error";
+  return prefix + ": " + normalizeString(fallbackText || "request failed");
+}
 
-  if (track.artist && track.artist.name) return normalizeString(track.artist.name);
-
-  if (Array.isArray(track.artists) && track.artists.length > 0) {
-    var names = [];
-    for (var i = 0; i < track.artists.length; i++) {
-      var artist = track.artists[i];
-      if (!artist) continue;
-      if (artist.name) names.push(normalizeString(artist.name));
-      else if (typeof artist === "string") names.push(artist);
-    }
-    return names.join(", ");
+async function resolveAccessToken(context) {
+  var directToken = normalizeString(getSettingValue(context, "accessToken", "")).trim();
+  if (directToken) {
+    return {
+      ok: true,
+      token: directToken,
+      authType: "direct"
+    };
   }
 
-  return "";
-}
+  var clientId = normalizeString(getSettingValue(context, "clientId", "")).trim();
+  var clientSecret = normalizeString(getSettingValue(context, "clientSecret", "")).trim();
 
-function getAlbumName(track) {
-  if (!isObject(track)) return "";
-  if (track.album && track.album.title) return normalizeString(track.album.title);
-  if (track.album && track.album.name) return normalizeString(track.album.name);
-  if (track.albumTitle) return normalizeString(track.albumTitle);
-  return "";
-}
-
-function getAlbumCover(track) {
-  if (!isObject(track)) return null;
-
-  var album = track.album || {};
-  if (album.imageUrl) return normalizeString(album.imageUrl);
-  if (album.cover) return normalizeString(album.cover);
-
-  if (Array.isArray(album.images) && album.images.length > 0) {
-    for (var i = 0; i < album.images.length; i++) {
-      var image = album.images[i];
-      if (image && image.url) return normalizeString(image.url);
-      if (typeof image === "string") return image;
-    }
+  if (!clientId || !clientSecret) {
+    return {
+      ok: false,
+      status: 0,
+      error: "TIDAL OAuth failed: missing client credentials"
+    };
   }
 
-  if (track.imageUrl) return normalizeString(track.imageUrl);
-  return null;
-}
+  var cacheKey = clientId + "::" + clientSecret;
+  if (AUTH_CACHE.cacheKey === cacheKey && AUTH_CACHE.token && AUTH_CACHE.expiresAt > nowEpochMs() + 30000) {
+    return {
+      ok: true,
+      token: AUTH_CACHE.token,
+      authType: "client_credentials"
+    };
+  }
 
-function normalizeTrack(track) {
-  if (!isObject(track)) return null;
+  var basicToken = base64Encode(clientId + ":" + clientSecret);
+  var tokenResult = await fetchApi(TIDAL_AUTH_URL, {
+    method: "POST",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/x-www-form-urlencoded",
+      Authorization: "Basic " + basicToken
+    },
+    body: "grant_type=client_credentials"
+  });
 
-  var id = track.id !== undefined ? track.id : track.trackId;
-  if (id === undefined || id === null || id === "") return null;
+  if (!tokenResult.ok) {
+    return {
+      ok: false,
+      status: tokenResult.status,
+      error: mapApiError("TIDAL OAuth failed", tokenResult.status, tokenResult.error)
+    };
+  }
+
+  var payload = tokenResult.data || {};
+  var token = normalizeString(payload.access_token).trim();
+  var expiresIn = normalizeNumber(payload.expires_in, 0);
+
+  if (!token) {
+    return {
+      ok: false,
+      status: tokenResult.status,
+      error: "TIDAL OAuth failed: access token missing in response"
+    };
+  }
+
+  AUTH_CACHE.cacheKey = cacheKey;
+  AUTH_CACHE.token = token;
+  AUTH_CACHE.expiresAt = nowEpochMs() + (expiresIn > 0 ? Math.max(60, expiresIn - 60) * 1000 : 15 * 60 * 1000);
 
   return {
-    id: normalizeString(id),
-    title: normalizeString(track.title || track.name || ""),
-    artist: getArtistName(track),
-    album: getAlbumName(track),
-    duration: normalizeNumber(track.duration || track.durationSec || 0, 0),
-    albumCover: getAlbumCover(track)
+    ok: true,
+    token: token,
+    authType: "client_credentials"
   };
 }
 
-function extractSearchItems(data) {
-  if (!data) return [];
+async function fetchTidalJson(path, queryParams, context) {
+  var auth = await resolveAccessToken(context);
+  if (!auth.ok) {
+    return {
+      ok: false,
+      status: auth.status || 0,
+      error: auth.error
+    };
+  }
 
-  if (Array.isArray(data.tracks)) return data.tracks;
+  var url = buildUrl(path, queryParams);
+  var result = await fetchApi(url, {
+    method: "GET",
+    headers: {
+      Accept: "application/json",
+      Authorization: "Bearer " + auth.token
+    }
+  });
 
-  if (isObject(data.tracks) && Array.isArray(data.tracks.items)) return data.tracks.items;
+  if (!result.ok) {
+    return {
+      ok: false,
+      status: result.status,
+      error: mapApiError("TIDAL request failed", result.status, result.error),
+      data: result.data
+    };
+  }
 
-  if (Array.isArray(data.items)) return data.items;
-
-  return [];
+  return {
+    ok: true,
+    status: result.status,
+    data: result.data
+  };
 }
 
 function normalizeQuality(quality) {
@@ -284,6 +400,338 @@ function qualityFallbackOrder(requested) {
   }
 }
 
+function normalizeResourceType(type) {
+  var t = normalizeString(type).toLowerCase().trim();
+  if (!t) return "";
+  if (t.indexOf("track") !== -1) return "track";
+  if (t.indexOf("artist") !== -1) return "artist";
+  if (t.indexOf("album") !== -1) return "album";
+  return t;
+}
+
+function mapIncludedResources(included) {
+  var map = {};
+
+  if (!Array.isArray(included)) return map;
+
+  for (var i = 0; i < included.length; i++) {
+    var item = included[i];
+    if (!isObject(item)) continue;
+    var type = normalizeResourceType(item.type);
+    var id = normalizeString(item.id);
+    if (!type || !id) continue;
+
+    var key = type + ":" + id;
+    map[key] = item;
+  }
+
+  return map;
+}
+
+function findRelationshipData(resource, relationName) {
+  if (!isObject(resource) || !isObject(resource.relationships)) return [];
+  var rel = resource.relationships[relationName];
+  if (!isObject(rel)) return [];
+
+  var data = rel.data;
+  if (Array.isArray(data)) return data;
+  if (isObject(data)) return [data];
+  return [];
+}
+
+function getImageUrlFromAttributes(attributes) {
+  if (!isObject(attributes)) return null;
+
+  if (attributes.imageUrl) return normalizeString(attributes.imageUrl);
+  if (attributes.coverArtUrl) return normalizeString(attributes.coverArtUrl);
+  if (attributes.coverUrl) return normalizeString(attributes.coverUrl);
+
+  if (Array.isArray(attributes.images)) {
+    for (var i = 0; i < attributes.images.length; i++) {
+      var image = attributes.images[i];
+      if (typeof image === "string") return image;
+      if (isObject(image) && image.url) return normalizeString(image.url);
+    }
+  }
+
+  return null;
+}
+
+function joinNames(names) {
+  if (!Array.isArray(names)) return "";
+  var filtered = [];
+
+  for (var i = 0; i < names.length; i++) {
+    var name = normalizeString(names[i]).trim();
+    if (name) filtered.push(name);
+  }
+
+  return filtered.join(", ");
+}
+
+function normalizeTrackResource(trackResource, includedMap) {
+  if (!isObject(trackResource)) return null;
+
+  var trackId = normalizeString(trackResource.id).trim();
+  if (!trackId) return null;
+
+  var attributes = isObject(trackResource.attributes) ? trackResource.attributes : {};
+  var title = normalizeString(attributes.title || attributes.name || "");
+  var duration = normalizeNumber(attributes.duration, normalizeNumber(attributes.durationSec, 0));
+
+  var artistNames = [];
+  var artistRel = findRelationshipData(trackResource, "artists");
+  for (var i = 0; i < artistRel.length; i++) {
+    var artistNode = artistRel[i];
+    if (!artistNode) continue;
+    var artistId = normalizeString(artistNode.id);
+    if (!artistId) continue;
+
+    var artistResource = includedMap["artist:" + artistId] || includedMap["artists:" + artistId];
+    if (artistResource && artistResource.attributes && artistResource.attributes.name) {
+      artistNames.push(normalizeString(artistResource.attributes.name));
+    }
+  }
+
+  var albumTitle = "";
+  var albumCover = null;
+
+  var albumRel = findRelationshipData(trackResource, "album");
+  if (albumRel.length === 0) albumRel = findRelationshipData(trackResource, "albums");
+  if (albumRel.length > 0) {
+    var albumId = normalizeString(albumRel[0] && albumRel[0].id);
+    var albumResource = includedMap["album:" + albumId] || includedMap["albums:" + albumId];
+    if (albumResource && albumResource.attributes) {
+      albumTitle = normalizeString(albumResource.attributes.title || albumResource.attributes.name || "");
+      albumCover = getImageUrlFromAttributes(albumResource.attributes);
+    }
+  }
+
+  if (!albumTitle) albumTitle = normalizeString(attributes.albumTitle || "");
+  if (!albumCover) albumCover = getImageUrlFromAttributes(attributes);
+
+  return {
+    id: trackId,
+    title: title,
+    artist: joinNames(artistNames),
+    album: albumTitle,
+    duration: duration,
+    albumCover: albumCover
+  };
+}
+
+function collectTrackResourcesFromSearch(data) {
+  var trackResources = [];
+
+  if (!data) return trackResources;
+
+  var included = Array.isArray(data.included) ? data.included : [];
+  for (var i = 0; i < included.length; i++) {
+    var item = included[i];
+    if (normalizeResourceType(item && item.type) === "track") {
+      trackResources.push(item);
+    }
+  }
+
+  var records = Array.isArray(data.data) ? data.data : isObject(data.data) ? [data.data] : [];
+
+  for (var j = 0; j < records.length; j++) {
+    var row = records[j];
+    var rowType = normalizeResourceType(row && row.type);
+    if (rowType === "track") {
+      trackResources.push(row);
+      continue;
+    }
+
+    var relTracks = findRelationshipData(row, "tracks");
+    for (var k = 0; k < relTracks.length; k++) {
+      var relTrack = relTracks[k];
+      if (!isObject(relTrack)) continue;
+      var trackId = normalizeString(relTrack.id);
+      if (!trackId) continue;
+      trackResources.push({ type: "track", id: trackId });
+    }
+  }
+
+  return trackResources;
+}
+
+function uniqueTrackIds(trackResources) {
+  var ids = [];
+  var seen = {};
+
+  for (var i = 0; i < trackResources.length; i++) {
+    var resource = trackResources[i];
+    var id = normalizeString(resource && resource.id).trim();
+    if (!id || seen[id]) continue;
+    seen[id] = true;
+    ids.push(id);
+  }
+
+  return ids;
+}
+
+function mergeTrackMaps(primaryMap, secondaryMap) {
+  var merged = {};
+  var key;
+
+  for (key in primaryMap) {
+    if (Object.prototype.hasOwnProperty.call(primaryMap, key)) {
+      merged[key] = primaryMap[key];
+    }
+  }
+
+  for (key in secondaryMap) {
+    if (Object.prototype.hasOwnProperty.call(secondaryMap, key)) {
+      var source = secondaryMap[key];
+      if (!merged[key]) {
+        merged[key] = source;
+      } else {
+        var target = merged[key];
+        if (!target.title && source.title) target.title = source.title;
+        if (!target.artist && source.artist) target.artist = source.artist;
+        if (!target.album && source.album) target.album = source.album;
+        if ((!target.duration || target.duration <= 0) && source.duration > 0) target.duration = source.duration;
+        if (!target.albumCover && source.albumCover) target.albumCover = source.albumCover;
+      }
+    }
+  }
+
+  return merged;
+}
+
+async function hydrateTracks(trackIds, context) {
+  if (!Array.isArray(trackIds) || trackIds.length === 0) return {};
+
+  var chunks = [];
+  var i;
+  for (i = 0; i < trackIds.length; i += 20) {
+    chunks.push(trackIds.slice(i, i + 20));
+  }
+
+  var resultMap = {};
+  for (i = 0; i < chunks.length; i++) {
+    var ids = chunks[i];
+    var response = await fetchTidalJson(
+      "/tracks",
+      {
+        "filter[id]": ids.join(","),
+        include: "artists,albums",
+        countryCode: getCountryCode(context)
+      },
+      context
+    );
+
+    if (!response.ok) {
+      continue;
+    }
+
+    var payload = response.data || {};
+    var includedMap = mapIncludedResources(payload.included || []);
+    var list = Array.isArray(payload.data) ? payload.data : isObject(payload.data) ? [payload.data] : [];
+
+    for (var j = 0; j < list.length; j++) {
+      var track = normalizeTrackResource(list[j], includedMap);
+      if (!track) continue;
+      resultMap[track.id] = track;
+    }
+  }
+
+  return resultMap;
+}
+
+async function searchTracks(query, limit, context) {
+  var q = normalizeString(query).trim();
+  var safeLimit = normalizeNumber(limit, DEFAULT_LIMIT);
+
+  if (!q) {
+    return { tracks: [], total: 0, error: "search failed: query is required" };
+  }
+
+  if (safeLimit <= 0) safeLimit = DEFAULT_LIMIT;
+  if (safeLimit > MAX_LIMIT) safeLimit = MAX_LIMIT;
+
+  var response = await fetchTidalJson(
+    "/searchResults/" + encodeURIComponent(q),
+    {
+      types: "tracks",
+      include: "tracks,artists,albums",
+      limit: String(safeLimit),
+      countryCode: getCountryCode(context)
+    },
+    context
+  );
+
+  if (!response.ok) {
+    return {
+      tracks: [],
+      total: 0,
+      status: response.status,
+      error: mapApiError("search failed", response.status, response.error)
+    };
+  }
+
+  var payload = response.data || {};
+  var includedMap = mapIncludedResources(payload.included || []);
+  var trackResources = collectTrackResourcesFromSearch(payload);
+  var foundIds = uniqueTrackIds(trackResources);
+
+  var normalizedMap = {};
+  for (var i = 0; i < trackResources.length; i++) {
+    var track = normalizeTrackResource(trackResources[i], includedMap);
+    if (!track) continue;
+    normalizedMap[track.id] = track;
+  }
+
+  if (foundIds.length > 0) {
+    var hydratedMap = await hydrateTracks(foundIds, context);
+    normalizedMap = mergeTrackMaps(hydratedMap, normalizedMap);
+  }
+
+  var tracks = [];
+  for (var j = 0; j < foundIds.length && tracks.length < safeLimit; j++) {
+    var id = foundIds[j];
+    var entry = normalizedMap[id];
+    if (!entry) continue;
+
+    if (!entry.title) entry.title = "";
+    if (!entry.artist) entry.artist = "";
+    if (!entry.album) entry.album = "";
+    if (!entry.duration || entry.duration < 0) entry.duration = 0;
+
+    tracks.push({
+      id: normalizeString(entry.id),
+      title: normalizeString(entry.title),
+      artist: normalizeString(entry.artist),
+      album: normalizeString(entry.album),
+      duration: normalizeNumber(entry.duration, 0),
+      albumCover: entry.albumCover ? normalizeString(entry.albumCover) : null
+    });
+  }
+
+  return {
+    tracks: tracks,
+    total: tracks.length
+  };
+}
+
+function decodeManifest(manifest) {
+  if (!manifest) return null;
+
+  if (isObject(manifest)) return manifest;
+
+  var asText = normalizeString(manifest);
+  if (!asText) return null;
+
+  var parsed = safeJsonParse(asText);
+  if (parsed) return parsed;
+
+  var decoded = base64Decode(asText);
+  if (!decoded) return null;
+
+  return safeJsonParse(decoded);
+}
+
 function normalizeCandidateQuality(value) {
   var q = normalizeString(value).toUpperCase();
   if (q === QUALITY.DOLBY_ATMOS) return QUALITY.DOLBY_ATMOS;
@@ -294,108 +742,118 @@ function normalizeCandidateQuality(value) {
   return QUALITY.HIGH;
 }
 
+function isCodecLossless(codecText, mimeTypeText) {
+  var codec = normalizeString(codecText).toLowerCase();
+  var mime = normalizeString(mimeTypeText).toLowerCase();
+  if (codec.indexOf("flac") !== -1) return true;
+  if (codec.indexOf("alac") !== -1) return true;
+  if (codec.indexOf("wav") !== -1) return true;
+  if (codec.indexOf("pcm") !== -1) return true;
+  if (mime.indexOf("flac") !== -1) return true;
+  if (mime.indexOf("wav") !== -1) return true;
+  return false;
+}
+
+function isCodecLossy(codecText, mimeTypeText) {
+  var codec = normalizeString(codecText).toLowerCase();
+  var mime = normalizeString(mimeTypeText).toLowerCase();
+  if (codec.indexOf("aac") !== -1) return true;
+  if (codec.indexOf("mp3") !== -1) return true;
+  if (codec.indexOf("opus") !== -1) return true;
+  if (codec.indexOf("vorbis") !== -1) return true;
+  if (mime.indexOf("aac") !== -1) return true;
+  if (mime.indexOf("mpeg") !== -1) return true;
+  if (mime.indexOf("opus") !== -1) return true;
+  return false;
+}
+
+function detectAtmos(manifest, codecText) {
+  var mode = normalizeString(manifest && manifest.audioMode).toUpperCase();
+  if (mode === "DOLBY_ATMOS") return true;
+  var codec = normalizeString(codecText).toLowerCase();
+  if (codec.indexOf("ec-3") !== -1 || codec.indexOf("eac3") !== -1 || codec.indexOf("atmos") !== -1) return true;
+  return false;
+}
+
+function qualityFromManifest(qualityHint, manifest, mimeType, codec) {
+  var detected = normalizeCandidateQuality(qualityHint || (manifest && manifest.audioQuality));
+  var atmos = detectAtmos(manifest, codec);
+  var lossless = isCodecLossless(codec, mimeType);
+  var lossy = isCodecLossy(codec, mimeType);
+
+  if (atmos) return QUALITY.DOLBY_ATMOS;
+
+  if (detected === QUALITY.DOLBY_ATMOS && !atmos) detected = QUALITY.HIGH;
+
+  if ((detected === QUALITY.HI_RES_LOSSLESS || detected === QUALITY.LOSSLESS) && lossy && !lossless) {
+    return QUALITY.HIGH;
+  }
+
+  return detected;
+}
+
 function pushCandidate(candidates, url, quality, mimeType, isLossless) {
-  if (!url) return;
-  var asString = normalizeString(url);
-  if (!asString) return;
+  var stream = normalizeString(url).trim();
+  if (!stream) return;
 
   candidates.push({
-    streamUrl: asString,
+    streamUrl: stream,
     quality: normalizeCandidateQuality(quality),
-    mimeType: normalizeString(mimeType || "audio/flac"),
+    mimeType: normalizeString(mimeType || "audio/*"),
     isLossless: !!isLossless
   });
 }
 
-function addAudioObjectCandidates(candidates, audioObj) {
-  if (!isObject(audioObj)) return;
-
-  var map = [
-    { key: "DolbyAtmos", quality: QUALITY.DOLBY_ATMOS, lossless: false },
-    { key: "dolbyAtmos", quality: QUALITY.DOLBY_ATMOS, lossless: false },
-    { key: "hifi", quality: QUALITY.HI_RES_LOSSLESS, lossless: true },
-    { key: "hiRes", quality: QUALITY.HI_RES_LOSSLESS, lossless: true },
-    { key: "lossless", quality: QUALITY.LOSSLESS, lossless: true },
-    { key: "high", quality: QUALITY.HIGH, lossless: false },
-    { key: "standard", quality: QUALITY.LOW, lossless: false },
-    { key: "low", quality: QUALITY.LOW, lossless: false }
-  ];
-
-  for (var i = 0; i < map.length; i++) {
-    var entry = map[i];
-    var node = audioObj[entry.key];
-    if (!node) continue;
-
-    if (typeof node === "string") {
-      pushCandidate(candidates, node, entry.quality, null, entry.lossless);
-      continue;
-    }
-
-    if (isObject(node)) {
-      if (node.url) pushCandidate(candidates, node.url, node.audioQuality || entry.quality, node.mimeType, entry.lossless);
-      if (node.streamUrl) pushCandidate(candidates, node.streamUrl, node.audioQuality || entry.quality, node.mimeType, entry.lossless);
-      if (Array.isArray(node.urls)) {
-        for (var j = 0; j < node.urls.length; j++) {
-          pushCandidate(candidates, node.urls[j], node.audioQuality || entry.quality, node.mimeType, entry.lossless);
-        }
-      }
-    }
-  }
-}
-
-function extractPlaybackTrack(data) {
-  if (!data) return null;
-  if (Array.isArray(data.tracks) && data.tracks.length > 0) return data.tracks[0];
-  if (isObject(data.track)) return data.track;
-  if (isObject(data.item)) return data.item;
-  if (isObject(data)) return data;
-  return null;
-}
-
 function addManifestCandidates(candidates, data, requestedQuality) {
-  var manifest = decodeManifest(data && data.manifest);
+  if (!data) return;
+
+  var manifest = decodeManifest(data.manifest);
   if (!manifest) return;
 
   var urls = [];
-  if (Array.isArray(manifest.urls)) urls = manifest.urls;
-  else if (manifest.url) urls = [manifest.url];
+  if (Array.isArray(manifest.urls)) {
+    urls = manifest.urls;
+  } else if (manifest.url) {
+    urls = [manifest.url];
+  }
 
-  var derivedQuality =
-    data && data.audioQuality
-      ? data.audioQuality
-      : manifest.audioQuality
-      ? manifest.audioQuality
-      : requestedQuality;
+  var mimeType = normalizeString(
+    manifest.mimeType ||
+      manifest.contentType ||
+      data.manifestMimeType ||
+      data.mimeType ||
+      "audio/*"
+  );
 
-  var mimeType = manifest.mimeType || data.manifestMimeType || "audio/flac";
-  var quality = normalizeCandidateQuality(derivedQuality);
-  var isLossless = quality === QUALITY.HI_RES_LOSSLESS || quality === QUALITY.LOSSLESS || /flac/i.test(mimeType);
+  var codecs = normalizeString(
+    manifest.codecs ||
+      manifest.codec ||
+      manifest.audioCodec ||
+      ""
+  );
+
+  var quality = qualityFromManifest(data.audioQuality || requestedQuality, manifest, mimeType, codecs);
+  var lossless = isCodecLossless(codecs, mimeType);
 
   for (var i = 0; i < urls.length; i++) {
-    pushCandidate(candidates, urls[i], quality, mimeType, isLossless);
+    pushCandidate(candidates, urls[i], quality, mimeType, lossless);
   }
 }
 
 function addDirectUrlCandidates(candidates, data, requestedQuality) {
   if (!data) return;
-  var derivedQuality = normalizeCandidateQuality(data.audioQuality || requestedQuality);
-  var derivedMimeType = normalizeString(data.mimeType || "");
-  var inferredLossless =
-    derivedQuality === QUALITY.HI_RES_LOSSLESS ||
-    derivedQuality === QUALITY.LOSSLESS ||
-    /flac/i.test(derivedMimeType);
 
-  if (data.streamUrl) {
-    pushCandidate(candidates, data.streamUrl, derivedQuality, derivedMimeType, inferredLossless);
-  }
+  var mimeType = normalizeString(data.mimeType || "audio/*");
+  var codec = normalizeString(data.codec || data.codecs || "");
+  var quality = qualityFromManifest(data.audioQuality || requestedQuality, data, mimeType, codec);
+  var lossless = isCodecLossless(codec, mimeType);
 
-  if (data.url) {
-    pushCandidate(candidates, data.url, derivedQuality, derivedMimeType, inferredLossless);
-  }
+  if (data.streamUrl) pushCandidate(candidates, data.streamUrl, quality, mimeType, lossless);
+  if (data.url) pushCandidate(candidates, data.url, quality, mimeType, lossless);
 
   if (Array.isArray(data.urls)) {
     for (var i = 0; i < data.urls.length; i++) {
-      pushCandidate(candidates, data.urls[i], derivedQuality, derivedMimeType, inferredLossless);
+      pushCandidate(candidates, data.urls[i], quality, mimeType, lossless);
     }
   }
 }
@@ -409,13 +867,11 @@ function chooseCandidate(candidates, requestedQuality) {
     var wanted = order[i];
     for (var j = 0; j < candidates.length; j++) {
       var item = candidates[j];
-      if (!item) continue;
-      if (item.quality === wanted) {
-        if ((wanted === QUALITY.HI_RES_LOSSLESS || wanted === QUALITY.LOSSLESS) && !item.isLossless) {
-          continue;
-        }
-        return item;
+      if (!item || item.quality !== wanted) continue;
+      if ((wanted === QUALITY.HI_RES_LOSSLESS || wanted === QUALITY.LOSSLESS) && !item.isLossless) {
+        continue;
       }
+      return item;
     }
   }
 
@@ -429,57 +885,25 @@ function chooseCandidate(candidates, requestedQuality) {
 function isForbiddenNonTidalStream(url) {
   var normalized = normalizeString(url).toLowerCase();
   if (!normalized) return true;
-  return normalized.indexOf("youtube.com") !== -1 || normalized.indexOf("googlevideo.com") !== -1;
+  if (normalized.indexOf("youtube.com") !== -1) return true;
+  if (normalized.indexOf("googlevideo.com") !== -1) return true;
+  return false;
 }
 
-async function searchTracks(query, limit) {
-  var q = normalizeString(query).trim();
-  var safeLimit = normalizeNumber(limit, 20);
-
-  if (!q) {
-    return { tracks: [], total: 0, error: "Search query is required" };
-  }
-
-  if (safeLimit <= 0) safeLimit = 20;
-  if (safeLimit > 100) safeLimit = 100;
-
-  var params = {
-    query: q,
-    limit: String(safeLimit),
-    "tidal:mediaArtist": "",
-    "tidal:mediaTrack": "",
-    "tidal:mediaAlbum": "",
-    "tidal:music": "Track",
-    countryCode: DEFAULT_COUNTRY_CODE
-  };
-
-  var url = BASE_URL + "/v1/search?" + buildQuery(params);
-  var result = await fetchJson(url);
-
-  if (!result.ok) {
-    return {
-      tracks: [],
-      total: 0,
-      error: "TIDAL search failed: " + result.error,
-      status: result.status
-    };
-  }
-
-  var rawTracks = extractSearchItems(result.data);
-  var tracks = [];
-
-  for (var i = 0; i < rawTracks.length; i++) {
-    var normalized = normalizeTrack(rawTracks[i]);
-    if (normalized) tracks.push(normalized);
-  }
-
-  return {
-    tracks: tracks,
-    total: tracks.length
-  };
+async function fetchTrackManifest(trackId, quality, context) {
+  return fetchTidalJson(
+    "/trackManifests/" + encodeURIComponent(trackId),
+    {
+      audioQuality: quality,
+      playbackMode: "STREAM",
+      assetPresentation: "FULL",
+      countryCode: getCountryCode(context)
+    },
+    context
+  );
 }
 
-async function getTrackStreamUrl(trackId, quality) {
+async function getTrackStreamUrl(trackId, quality, context) {
   var id = normalizeString(trackId).trim();
   var requestedQuality = normalizeQuality(quality);
 
@@ -490,56 +914,46 @@ async function getTrackStreamUrl(trackId, quality) {
     };
   }
 
-  var params = {
-    audioquality: requestedQuality,
-    playbackmode: "STREAM",
-    assetpresentation: "FULL",
-    countryCode: DEFAULT_COUNTRY_CODE
-  };
-
-  var url =
-    BASE_URL +
-    "/v1/tracks/" +
-    encodeURIComponent(id) +
-    "/playbackInfo?" +
-    buildQuery(params);
-
-  var result = await fetchJson(url);
-
-  if (!result.ok) {
-    return {
-      error: "TIDAL playbackInfo failed: " + result.error,
-      status: result.status,
-      track: { id: id, audioQuality: requestedQuality }
-    };
-  }
-
-  var data = result.data || {};
-  var playbackTrack = extractPlaybackTrack(data);
+  var fallbackList = qualityFallbackOrder(requestedQuality);
   var candidates = [];
+  var firstError = "";
+  var firstErrorStatus = 0;
 
-  if (playbackTrack && playbackTrack.audio) {
-    addAudioObjectCandidates(candidates, playbackTrack.audio);
+  for (var i = 0; i < fallbackList.length; i++) {
+    var currentQuality = fallbackList[i];
+    var result = await fetchTrackManifest(id, currentQuality, context);
+
+    if (!result.ok) {
+      if (!firstError) {
+        firstError = result.error || "manifest unavailable";
+        firstErrorStatus = result.status || 0;
+      }
+      continue;
+    }
+
+    var payload = result.data || {};
+    addManifestCandidates(candidates, payload, currentQuality);
+    addDirectUrlCandidates(candidates, payload, currentQuality);
+
+    if (isObject(payload.data)) {
+      addManifestCandidates(candidates, payload.data, currentQuality);
+      addDirectUrlCandidates(candidates, payload.data, currentQuality);
+    }
   }
-
-  if (data.audio) {
-    addAudioObjectCandidates(candidates, data.audio);
-  }
-
-  addManifestCandidates(candidates, data, requestedQuality);
-  addDirectUrlCandidates(candidates, data, requestedQuality);
 
   var selected = chooseCandidate(candidates, requestedQuality);
+
   if (!selected || !selected.streamUrl) {
     return {
-      error: "No playable TIDAL stream found for requested quality",
+      error: firstError ? mapApiError("manifest unavailable", firstErrorStatus, firstError) : "manifest unavailable",
+      status: firstErrorStatus,
       track: { id: id, audioQuality: requestedQuality }
     };
   }
 
   if (isForbiddenNonTidalStream(selected.streamUrl)) {
     return {
-      error: "PlaybackInfo returned a non-TIDAL stream URL",
+      error: "manifest unavailable: non-TIDAL stream URL",
       track: { id: id, audioQuality: requestedQuality }
     };
   }
