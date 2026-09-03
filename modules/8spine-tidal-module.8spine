@@ -285,8 +285,13 @@ function qualityFallbackOrder(requested) {
 }
 
 function normalizeCandidateQuality(value) {
-  var normalized = normalizeQuality(value);
-  return normalized;
+  var q = normalizeString(value).toUpperCase();
+  if (q === QUALITY.DOLBY_ATMOS) return QUALITY.DOLBY_ATMOS;
+  if (q === QUALITY.HI_RES_LOSSLESS) return QUALITY.HI_RES_LOSSLESS;
+  if (q === QUALITY.LOSSLESS) return QUALITY.LOSSLESS;
+  if (q === QUALITY.HIGH) return QUALITY.HIGH;
+  if (q === QUALITY.LOW) return QUALITY.LOW;
+  return QUALITY.HIGH;
 }
 
 function pushCandidate(candidates, url, quality, mimeType, isLossless) {
@@ -373,18 +378,24 @@ function addManifestCandidates(candidates, data, requestedQuality) {
 
 function addDirectUrlCandidates(candidates, data, requestedQuality) {
   if (!data) return;
+  var derivedQuality = normalizeCandidateQuality(data.audioQuality || requestedQuality);
+  var derivedMimeType = normalizeString(data.mimeType || "");
+  var inferredLossless =
+    derivedQuality === QUALITY.HI_RES_LOSSLESS ||
+    derivedQuality === QUALITY.LOSSLESS ||
+    /flac/i.test(derivedMimeType);
 
   if (data.streamUrl) {
-    pushCandidate(candidates, data.streamUrl, data.audioQuality || requestedQuality, data.mimeType, false);
+    pushCandidate(candidates, data.streamUrl, derivedQuality, derivedMimeType, inferredLossless);
   }
 
   if (data.url) {
-    pushCandidate(candidates, data.url, data.audioQuality || requestedQuality, data.mimeType, false);
+    pushCandidate(candidates, data.url, derivedQuality, derivedMimeType, inferredLossless);
   }
 
   if (Array.isArray(data.urls)) {
     for (var i = 0; i < data.urls.length; i++) {
-      pushCandidate(candidates, data.urls[i], data.audioQuality || requestedQuality, data.mimeType, false);
+      pushCandidate(candidates, data.urls[i], derivedQuality, derivedMimeType, inferredLossless);
     }
   }
 }
